@@ -100,6 +100,19 @@ def parse_args():
         help="Override data.sft.cot_type; used as subfolder under sft checkpoint root",
     )
     parser.add_argument(
+        "--env-mode",
+        type=str,
+        choices=["strip", "mask", "keep"],
+        default=None,
+        help=(
+            "Override data.sft.env_mode: how to handle <call_env> in the response. "
+            "'strip' deletes the tag AND the opponent's reply (legacy; makes "
+            "continuation data an illegal move sequence). 'mask' deletes only the "
+            "tag, keeps the opponent's replies in the sequence and excludes them "
+            "from the loss. 'keep' leaves the text untouched (multi-turn)."
+        ),
+    )
+    parser.add_argument(
         "--block-size",
         type=int,
         default=None,
@@ -198,6 +211,11 @@ def main():
         if not cfg.data.get("sft"):
             cfg.data.sft = {}
         cfg.data.sft.cot_type = args.cot_type
+
+    if args.env_mode:
+        if not cfg.data.get("sft"):
+            cfg.data.sft = {}
+        cfg.data.sft.env_mode = args.env_mode
 
     if args.block_size is not None:
         cfg.model.block_size = args.block_size

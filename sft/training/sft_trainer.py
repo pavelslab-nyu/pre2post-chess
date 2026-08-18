@@ -92,10 +92,29 @@ class SFTTrainer:
         _parts = cot_field.split(".")
         _cot_method = _parts[1] if len(_parts) >= 2 else _parts[0]
         self.use_thinking = _cot_method not in _NON_THINKING_METHODS
-        # In non-multi-turn mode, strip any <call_env> strings from the response text
-        # before tokenizing. This is a no-op when the data has no env tokens.
-        self._strip_env_tokens = not multi_turn
-        self.acc.print(f"[SFT] use_thinking={self.use_thinking} strip_env_tokens={self._strip_env_tokens} (cot_field={cot_field!r})")
+        # How to handle <call_env> in the response (see SFTDataset.env_mode):
+        #   multi_turn  -> 'keep'  (<call_env> is a real vocab token, env replies masked)
+        #   single-turn -> 'strip' by default (legacy), or 'mask' when requested.
+        #
+        # 'strip' DELETES the opponent's reply along with the tag, which makes
+        # continuation-style data (solution_continuation) an illegal move sequence
+        # from the second move onwards.  Use env_mode='mask' for those: the
+        # opponent's replies stay in input_ids (board stays legal) but are excluded
+        # from the loss.
+        _env_mode_cfg = sft_config.get("env_mode", None)
+        if multi_turn:
+            if _env_mode_cfg not in (None, "keep"):
+                raise ValueError(
+                    f"data.sft.env_mode={_env_mode_cfg!r} is incompatible with multi_turn=True "
+                    "(multi-turn keeps <call_env> and masks env replies itself)"
+                )
+            self.env_mode = "keep"
+        else:
+            self.env_mode = _env_mode_cfg or "strip"
+        if self.env_mode not in ("strip", "mask", "keep"):
+            raise ValueError(f"data.sft.env_mode must be 'strip'/'mask'/'keep', got {self.env_mode!r}")
+        self._strip_env_tokens = (self.env_mode == "strip")
+        self.acc.print(f"[SFT] use_thinking={self.use_thinking} env_mode={self.env_mode} (cot_field={cot_field!r})")
         if multi_turn:
             self.acc.print("[SFT] Multi-turn mode enabled: env response tokens after <call_env> will be masked.")
             self.tokcfg["include_env_tokens"] = True
@@ -161,6 +180,7 @@ class SFTTrainer:
             cot_field=sft_config.get("cot_field", "cot_format"),
             prompt_field=sft_config.get("prompt_field", "pgn"),
             strip_env_tokens=self._strip_env_tokens,
+            env_mode=self.env_mode,
         )
 
         self.eval_loader = None
@@ -176,6 +196,7 @@ class SFTTrainer:
                 cot_field=sft_config.get("cot_field", "cot_format"),
                 prompt_field=sft_config.get("prompt_field", "pgn"),
                 strip_env_tokens=self._strip_env_tokens,
+                env_mode=self.env_mode,
             )
         
         # ----- Model -----

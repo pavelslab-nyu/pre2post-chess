@@ -29,12 +29,47 @@ import json
 
 import re as _re
 
+_ENV_TAG = '<call_env>'
 _STRIP_ENV_RE = _re.compile(r'\s*<call_env>\s*\S*')
 
 
 def _strip_env_tokens(text: str) -> str:
-    """Remove each '<call_env> MOVE' pair from text, leaving only model outputs."""
+    """Remove each '<call_env> MOVE' pair from text, leaving only model outputs.
+
+    NOTE: this DELETES the opponent's reply, so the surviving moves are no longer a
+    legal continuation of the prompt position (e.g. "Qf3xc6+ <call_env> Pb7xc6
+    Bc4a6# <call_env>" becomes "Qf3xc6+ Bc4a6#", but Bc4a6# is only legal after
+    Black plays bxc6).  Prefer env_mode='mask' for continuation-style data; this
+    mode is kept for the single-move methods (best_move_only) and for backwards
+    compatibility.
+    """
     return _STRIP_ENV_RE.sub('', text)
+
+
+def _split_env_segments(text: str) -> Tuple[str, set]:
+    """Split a multi-turn continuation into text-without-tags + opponent word indices.
+
+    Expected pattern (verified over the puzzle_seq shards):
+
+        own <call_env> opp own <call_env> opp own ... <call_env>
+
+    i.e. the first segment is the model's own move, and every segment AFTER a
+    <call_env> starts with exactly one opponent reply followed by the model's next
+    own move.  The trailing <call_env> yields an empty final segment.
+
+    Returns:
+        (text with the <call_env> tags removed, set of word indices that are
+         opponent moves in that text)
+    """
+    words: List[str] = []
+    opponent_word_idx = set()
+    for seg_i, seg in enumerate(text.split(_ENV_TAG)):
+        for word_i, word in enumerate(seg.split()):
+            if seg_i >= 1 and word_i == 0:
+                # First token after a <call_env> is the environment's reply.
+                opponent_word_idx.add(len(words))
+            words.append(word)
+    return ' '.join(words), opponent_word_idx
 
 
 def get_nested_field(data: Dict, field_path: str, default: Any = '') -> Any:
@@ -77,6 +112,7 @@ class SFTDataset(Dataset):
         cot_field: str = "cot_format",
         prompt_field: str = "pgn",
         strip_env_tokens: bool = False,
+        env_mode: Optional[str] = None,
     ):
         """
         Args:
@@ -99,6 +135,31 @@ class SFTDataset(Dataset):
         self.cot_field = cot_field
         self.prompt_field = prompt_field
         self.strip_env_tokens = strip_env_tokens
+
+        # Resolve env handling.  Defaults reproduce the previous behaviour exactly.
+        if env_mode is None:
+            env_mode = 'strip' if strip_env_tokens else 'keep'
+        if env_mode not in ('strip', 'mask', 'keep'):
+            raise ValueError(f"env_mode must be one of 'strip'/'mask'/'keep', got {env_mode!r}")
+        self.env_mode = env_mode
+
+        # env_mode='mask' needs (a) force_lan encoding so that token spans are
+        # concatenative over whitespace words, and (b) per-move tokenization to
+        # compute those spans.  Fail loudly rather than mask the wrong tokens.
+        if env_mode == 'mask':
+            import inspect
+            if 'force_lan' not in inspect.signature(tokenizer.encode).parameters:
+                raise ValueError(
+                    "env_mode='mask' requires a tokenizer whose encode() accepts "
+                    "force_lan=True (e.g. LanTokenizerSFT); got "
+                    f"{type(tokenizer).__name__}"
+                )
+            if not hasattr(tokenizer, '_lan_move_to_tokens'):
+                raise ValueError(
+                    "env_mode='mask' requires tokenizer._lan_move_to_tokens() to "
+                    f"compute per-move token spans; got {type(tokenizer).__name__}"
+                )
+
         # Cache the <T> token ID so __getitem__ can detect thinking responses
         self._t_start_id = tokenizer.get_vocab().get("<T>") if hasattr(tokenizer, "get_vocab") else None
         # Cache EOS ID to strip it from non-thinking responses
@@ -110,8 +171,57 @@ class SFTDataset(Dataset):
             self.samples.extend(self._load_file(file_path))
         
         print(f"[SFT Dataset] Loaded {len(self.samples)} samples from {len(data_files)} files")
-        print(f"[SFT Dataset] Using cot_field='{cot_field}', prompt_field='{prompt_field}'")
-    
+        print(f"[SFT Dataset] Using cot_field='{cot_field}', prompt_field='{prompt_field}', env_mode='{self.env_mode}'")
+        if self.env_mode == 'mask':
+            n_masked = sum(len(s.get('env_spans') or []) for s in self.samples)
+            n_with = sum(1 for s in self.samples if s.get('env_spans'))
+            print(f"[SFT Dataset] env_mode=mask: {n_masked} opponent moves masked "
+                  f"across {n_with}/{len(self.samples)} samples")
+            # env_mode='mask' is for non-thinking continuation data (e.g.
+            # solution_continuation), which must not carry <T>/</T>/<sep>.  Their
+            # presence means the cot_field is a thinking format and the whole
+            # own/opponent alternation assumed by _split_env_segments is wrong.
+            _thinking = [t for t in ('<T>', '</T>', '<sep>')
+                         if any(t in s['response'] for s in self.samples)]
+            if _thinking:
+                print(f"[SFT Dataset] WARNING: env_mode='mask' but responses contain "
+                      f"{_thinking} — this is a thinking/multi-path format, and the "
+                      f"opponent-move masking assumes plain move continuations. "
+                      f"Check cot_field={self.cot_field!r}.")
+
+
+    def _encode_response(self, text: str) -> List[int]:
+        """Encode a response, forcing the LAN branch when spans must line up."""
+        if self.env_mode == 'mask':
+            return self.tokenizer.encode(text, force_lan=True)
+        return self.tokenizer.encode(text)
+
+    def _env_token_spans(self, text: str, opponent_word_idx: set) -> List[Tuple[int, int]]:
+        """Map opponent word indices to [start, end) token spans in response space.
+
+        Response space = self._encode_response(text) with the leading <bos> removed,
+        i.e. index 0 is the first LAN token.  Valid because force_lan encoding is
+        concatenative over whitespace words.
+        """
+        spans: List[Tuple[int, int]] = []
+        pos = 0
+        for i, word in enumerate(text.split()):
+            n_tok = len(self.tokenizer._lan_move_to_tokens(word))
+            if i in opponent_word_idx:
+                spans.append((pos, pos + n_tok))
+            pos += n_tok
+        return spans
+
+    def _prepare_response(self, raw: str) -> Tuple[str, List[Tuple[int, int]]]:
+        """Apply env handling to a raw CoT string. Returns (text, env_spans)."""
+        if self.env_mode == 'strip':
+            return _strip_env_tokens(raw), []
+        if self.env_mode == 'mask':
+            text, opponent_word_idx = _split_env_segments(raw)
+            return text, self._env_token_spans(text, opponent_word_idx)
+        return raw, []
+
+
     def _load_file(self, file_path: str) -> List[Dict]:
         """Load samples from a JSON or JSONL file."""
         file_path = Path(file_path)
@@ -147,16 +257,15 @@ class SFTDataset(Dataset):
                 
                 # Get response using configured CoT field (supports nested access)
                 cot_format = get_nested_field(result, self.cot_field, '').strip()
-                if self.strip_env_tokens:
-                    cot_format = _strip_env_tokens(cot_format)
-                
+                cot_format, env_spans = self._prepare_response(cot_format)
+
                 if not prompt or not cot_format:
                     skipped += 1
                     continue
                 
                 # Tokenize the same way as in __getitem__
                 prompt_token_ids = self.tokenizer.encode(prompt)[:-1]  # remove the eos token
-                response_token_ids = self.tokenizer.encode(cot_format)[1:]  # remove the bos token
+                response_token_ids = self._encode_response(cot_format)[1:]  # remove the bos token
                 # For non-thinking responses, strip trailing EOS so model learns to continue
                 is_thinking = (self._t_start_id is not None and len(response_token_ids) > 0
                                and response_token_ids[0] == self._t_start_id)
@@ -171,6 +280,8 @@ class SFTDataset(Dataset):
                 samples.append({
                     'prompt': prompt,
                     'response': cot_format,
+                    # [start, end) token spans (response space) to mask out of the loss
+                    'env_spans': env_spans,
                     # Store metadata for debugging
                     'target_move': result.get('target_move', ''),
                     'target_move_san': result.get('target_move_san', ''),
@@ -206,7 +317,7 @@ class SFTDataset(Dataset):
         
         # Encode the full text
         prompt_token_ids = self.tokenizer.encode(prompt)[:-1] # remove the eos token
-        response_token_ids = self.tokenizer.encode(response)[1:] # remove the bos token
+        response_token_ids = self._encode_response(response)[1:] # remove the bos token
 
         response_starts_with_T = (
             self._t_start_id is not None
@@ -245,7 +356,24 @@ class SFTDataset(Dataset):
             # Adjust prompt_length for the shift (input_ids = tokens[:-1], labels = tokens[1:])
             mask_length = min(prompt_length - 1, len(labels))
             labels[:mask_length] = -100  # -100 is ignored by PyTorch CrossEntropyLoss
-        
+
+        # Mask the environment's (opponent's) replies out of the loss.  They stay in
+        # input_ids so the board the model conditions on remains legal; only the
+        # gradient is removed.
+        #
+        # Index algebra: token_ids = prompt + response, so response token r_i lives
+        # at token_ids[L + i] with L = len(prompt_token_ids).  Since
+        # labels[j] = token_ids[j + 1], r_i is at labels[L + i - 1].
+        env_spans = sample.get('env_spans') or []
+        if env_spans:
+            L = len(prompt_token_ids)
+            n_labels = len(labels)
+            for start, end in env_spans:
+                lo = max(L + start - 1, 0)
+                hi = min(L + end - 1, n_labels)
+                if hi > lo:
+                    labels[lo:hi] = -100
+
         return input_ids, labels, attention_mask
 
 
@@ -459,6 +587,7 @@ def create_multi_turn_sft_dataloader(
     cot_field: str = "cot_format",
     prompt_field: str = "pgn",
     strip_env_tokens: bool = False,
+    env_mode: Optional[str] = None,
 ) -> DataLoader:
     """
     Create a DataLoader for multi-turn SFT training.
@@ -492,6 +621,7 @@ def create_multi_turn_sft_dataloader(
         cot_field=cot_field,
         prompt_field=prompt_field,
         strip_env_tokens=strip_env_tokens,
+        env_mode=env_mode,
     )
 
     if pad_token_id is None:
@@ -535,6 +665,7 @@ def create_sft_dataloader(
     cot_field: str = "cot_format",
     prompt_field: str = "pgn",
     strip_env_tokens: bool = False,
+    env_mode: Optional[str] = None,
 ) -> DataLoader:
     """
     Create a DataLoader for SFT training.
@@ -570,6 +701,7 @@ def create_sft_dataloader(
         cot_field=cot_field,
         prompt_field=prompt_field,
         strip_env_tokens=strip_env_tokens,
+        env_mode=env_mode,
     )
 
     # Determine pad token ID

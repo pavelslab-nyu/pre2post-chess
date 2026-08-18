@@ -287,16 +287,39 @@ class LanTokenizerSFT(BaseTokenizer):
                 out.extend(self._lan_move_to_tokens(token))
         return out
     
-    def encode(self, text: str) -> List[int]:
+    def encode(self, text: str, force_lan: bool = False) -> List[int]:
         """
         Encode text to token IDs.
-        
+
         Args:
             text: Text to encode (can be PGN or CoT formatted)
-        
+            force_lan: Treat `text` as a whitespace-separated list of LAN moves and
+                skip both the CoT and the PGN detection branches.
+
+                This matters for SFT *responses*.  `_pgn_to_tokens` is tried first
+                below and is accepted whenever it yields ANY moves, but
+                python-chess accepts long-algebraic SAN, so a response whose first
+                move happens to be legal from the *starting* position is parsed as
+                a game and everything after the first illegal move is silently
+                dropped:
+
+                    "Pf2f3 Qg4h3 Pd4xc5" -> ['P','f2','f3']       (rest lost)
+                    "Pg2g4#"             -> ['P','g2','g4']       ('#' lost)
+
+                force_lan=True also makes encoding *concatenative* over
+                whitespace words, which callers rely on to compute per-move token
+                spans (see SFTDataset._env_token_spans).
+
         Returns:
             List of token IDs
         """
+        if force_lan:
+            lan_tokens = []
+            for word in text.split():
+                lan_tokens.extend(self._lan_move_to_tokens(word))
+            tokens = [self._bos] + lan_tokens + [self._eos]
+            return self.tk.encode(" ".join(tokens)).ids
+
         # Check if this is CoT-formatted text (contains special tokens)
         sft_special = (
             [self.T, self.T_END, self.SEP]
