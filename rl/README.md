@@ -125,6 +125,23 @@ sbatch --export=ALL,CHECKPOINT_BASE=/path/to/checkpoints_hf_format \
   submit_eval_rl_single.sbatch
 ```
 
+`run_eval_all_ckps_pretrain.sh` is the counterpart for **pretrained base
+models**, which have no reasoning phase: it sets `THINKING=False` (so the
+rollout is a direct multi-turn game against the chess env, no `<T>` phase),
+points `REWARD_FUNCTION` at `reward_function.py` with
+`REWARD_TYPE=EVAL_ONLY_NONTHINK_BASED`, and reads the non-thinking eval
+parquets. It sweeps `step_<N>/` and `final/` checkpoint directories.
+
+```bash
+# every checkpoint of a pretrain run (step_<N> in order, then final)
+CHECKPOINT_BASE=/path/to/<pretrain_run> \
+  EVAL_DATA_DIR=/path/to/eval_nonthinking bash run_eval_all_ckps_pretrain.sh
+
+# selected checkpoints only
+CHECKPOINT_BASE=/path/to/<pretrain_run> \
+  STEPS="1006 3018 final" bash run_eval_all_ckps_pretrain.sh
+```
+
 ---
 
 ## Rollout modes
