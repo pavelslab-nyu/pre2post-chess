@@ -236,6 +236,16 @@ class SFTTrainer:
 
             # Load the config FIRST and apply any context-length / RoPE-scaling changes
             # to it before the model is instantiated. HF rotary-embedding modules read
+            # config.rope_scaling / max_position_embeddings once, in __init__, so editing
+            # model.config after from_pretrained() only changes the saved config.json and
+            # NOT the inv_freq / attention scaling the model is actually trained with.
+            #
+            # FIX (2026-09): previously this edit was applied AFTER from_pretrained(), so
+            # SFT runs with block_size > pretrain context were trained with plain RoPE
+            # extrapolation while the saved config claimed YaRN (a train/inference
+            # mismatch). Patching the config before instantiation means the model is
+            # actually trained with the extended context, which can improve post-SFT
+            # and downstream RL performance. Thanks to Jens Tuyls for spotting this.
             hf_config = AutoConfig.from_pretrained(pretrained_model, trust_remote_code=True)
             if "block_size" in self.mcfg and self.mcfg["block_size"] is not None:
                 bs = int(self.mcfg["block_size"])
