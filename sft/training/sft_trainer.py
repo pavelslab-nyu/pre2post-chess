@@ -234,8 +234,27 @@ class SFTTrainer:
                         "automatic path resolution."
                     )
 
+            # Load the config FIRST and apply any context-length / RoPE-scaling changes
+            # to it before the model is instantiated. HF rotary-embedding modules read
+            hf_config = AutoConfig.from_pretrained(pretrained_model, trust_remote_code=True)
+            if "block_size" in self.mcfg and self.mcfg["block_size"] is not None:
+                bs = int(self.mcfg["block_size"])
+                if hasattr(hf_config, "max_position_embeddings"):
+                    original_max_pos = int(hf_config.max_position_embeddings)
+                    if bs > original_max_pos:
+                        self.acc.print(
+                            f"[SFT] Extending context {original_max_pos} -> {bs} via YaRN "
+                            f"(factor={bs / original_max_pos:.3f})"
+                        )
+                        hf_config.max_position_embeddings = bs
+                        hf_config.rope_scaling = {"type": "yarn", "factor": bs / original_max_pos,
+                            "original_max_position_embeddings": original_max_pos}
+                if hasattr(hf_config, "n_positions"):
+                    hf_config.n_positions = bs
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 pretrained_model,
+                config=hf_config,
                 trust_remote_code=True,
             )
 
@@ -259,18 +278,6 @@ class SFTTrainer:
                 # print("[DEBUG] token_emb shape:", emb.shape)
                 # print("[DEBUG] token_emb first row:", emb[0][:8])
                 # print("[DEBUG] token_emb last row:", emb[-1][:8])
-
-            # optional: update context length in config (this does NOT resize pos embeddings automatically)
-            if "block_size" in self.mcfg and self.mcfg["block_size"] is not None:
-                bs = int(self.mcfg["block_size"])
-                if hasattr(self.model.config, "max_position_embeddings"):
-                    original_max_pos = int(self.model.config.max_position_embeddings)
-                    if bs > original_max_pos:
-                        self.model.config.max_position_embeddings = bs
-                        self.model.config.rope_scaling = {"type": "yarn", "factor": bs / original_max_pos,
-                            "original_max_position_embeddings": original_max_pos}
-                if hasattr(self.model.config, "n_positions"):
-                    self.model.config.n_positions = bs
 
             self._pretrained_loaded = True
 
