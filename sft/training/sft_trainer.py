@@ -235,10 +235,7 @@ class SFTTrainer:
                     )
 
             # Load the config FIRST and apply any context-length / RoPE-scaling changes
-            # to it before the model is instantiated. HF rotary-embedding modules read
-            # config.rope_scaling / max_position_embeddings once, in __init__, so editing
-            # model.config after from_pretrained() only changes the saved config.json and
-            # NOT the inv_freq / attention scaling the model is actually trained with.
+            # to it before the model is instantiated. 
             #
             # FIX (2026-09): previously this edit was applied AFTER from_pretrained(), so
             # SFT runs with block_size > pretrain context were trained with plain RoPE
