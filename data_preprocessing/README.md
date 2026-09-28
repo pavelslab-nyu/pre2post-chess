@@ -9,7 +9,7 @@ output) meant to be easy to read and adapt.
 The final tokenized pretraining dataset is **released on Hugging Face**, so you do
 not need to rerun any of this to reproduce training:
 
-- **`chess-pre-to-post/pretrain_v1_20b`** — tokenized `.npy` shards (~20B tokens).
+- **`pavelslab-nyu/pretrain_v1_54B`** — tokenized `.npy` shards (~20B tokens).
 
 ```bash
 huggingface-cli download chess-pre-to-post/pretrain_v1_20b \
