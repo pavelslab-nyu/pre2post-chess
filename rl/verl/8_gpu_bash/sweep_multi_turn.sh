@@ -49,11 +49,6 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-2048}"
 ROLLOUT_DTYPE="${ROLLOUT_DTYPE:-bfloat16}"
 USE_MULTITURN="${USE_MULTITURN:-True}"
 ENABLE_THINKING_MODE="${ENABLE_THINKING_MODE:-True}"
-# train/inference consistency: fp32 LM head on trainer + vLLM, and vLLM log-probs as pi_old
-FP32_LM_HEAD="${FP32_LM_HEAD:-False}"
-USE_ROLLOUT_LOG_PROBS="${USE_ROLLOUT_LOG_PROBS:-False}"
-CALCULATE_LOG_PROBS="${CALCULATE_LOG_PROBS:-${USE_ROLLOUT_LOG_PROBS}}"
-RECOMPUTE_LOG_PROB_FOR_METRICS="${RECOMPUTE_LOG_PROB_FOR_METRICS:-True}"
 
 declare -A SFT_CHECKPOINT_SELECTOR_BY_MODEL_ID=(
   # ["C9e18_200m_alpha0.740_beta0.03"]="step_700"
@@ -95,9 +90,6 @@ for spec in "${pretrain_specs[@]}"; do
   base_model="$(resolve_model_path "${run_dir}" "${selector}")"
 
   hparam_tag="${MODE}_lr${ACTOR_LR}_bs${TRAIN_BATCH_SIZE}_kl${KL_LOSS_COEF}_res${RES_LENGTH}"
-  # Own save dir per variant, so it never auto-resumes from (or overwrites) the baseline runs' checkpoints.
-  if [[ "${FP32_LM_HEAD}" == "True" ]]; then hparam_tag+="_fp32head"; fi
-  if [[ "${USE_ROLLOUT_LOG_PROBS}" == "True" ]]; then hparam_tag+="_vllmlp"; fi
   save_dir="${SAVE_ROOT}/${hparam_tag}"
   experiment_name="${model_id}"
 
@@ -108,8 +100,7 @@ for spec in "${pretrain_specs[@]}"; do
   export MODE BASE_MODEL="${base_model}" SAVE_DIR="${save_dir}" EXPERIMENT_NAME="${experiment_name}" \
     TOTAL_STEPS TRAIN_DATA_PATH EVAL_DATA_PATH CUSTOM_REWARD_PATH PROJECT_NAME \
     ACTOR_LR KL_LOSS_COEF TRAIN_BATCH_SIZE GROUP_SIZE RES_LENGTH SAVE_FREQ TEST_FREQ \
-    PPO_MICRO_BATCH_SIZE_PER_GPU MAX_NUM_SEQS ROLLOUT_DTYPE USE_MULTITURN ENABLE_THINKING_MODE \
-    FP32_LM_HEAD USE_ROLLOUT_LOG_PROBS CALCULATE_LOG_PROBS RECOMPUTE_LOG_PROB_FOR_METRICS
+    PPO_MICRO_BATCH_SIZE_PER_GPU MAX_NUM_SEQS ROLLOUT_DTYPE USE_MULTITURN ENABLE_THINKING_MODE
 
   bash "${RUNNER_SCRIPT}" > "${log_file}" 2>&1 &
 done

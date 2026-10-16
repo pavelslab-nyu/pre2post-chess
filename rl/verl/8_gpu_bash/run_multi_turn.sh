@@ -26,11 +26,6 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-2048}"
 ROLLOUT_DTYPE="${ROLLOUT_DTYPE:-bfloat16}"
 USE_MULTITURN="${USE_MULTITURN:-True}"
 ENABLE_THINKING_MODE="${ENABLE_THINKING_MODE:-True}"
-# train/inference consistency: fp32 LM head on trainer + vLLM, and vLLM log-probs as pi_old
-FP32_LM_HEAD="${FP32_LM_HEAD:-False}"
-USE_ROLLOUT_LOG_PROBS="${USE_ROLLOUT_LOG_PROBS:-False}"
-CALCULATE_LOG_PROBS="${CALCULATE_LOG_PROBS:-${USE_ROLLOUT_LOG_PROBS}}"
-RECOMPUTE_LOG_PROB_FOR_METRICS="${RECOMPUTE_LOG_PROB_FOR_METRICS:-True}"
 
 # --- derived paths ---
 CHECKPOINT_DIR="${SAVE_DIR}/${EXPERIMENT_NAME}/checkpoints"
@@ -60,7 +55,6 @@ mkdir -p "${CHECKPOINT_DIR}" "$(dirname "${LOG_FILE}")" "${MLFLOW_DIR}" "${ROLLO
 echo "Starting RL job (local) for ${EXPERIMENT_NAME}"
 echo "Mode=${MODE}  Model=${BASE_MODEL}"
 echo "Experiment=${EXPERIMENT_NAME}  total_steps=${TOTAL_STEPS}"
-echo "fp32_lm_head=${FP32_LM_HEAD}  use_rollout_log_probs=${USE_ROLLOUT_LOG_PROBS}  calculate_log_probs=${CALCULATE_LOG_PROBS}"
 
 # --- training command ---
 python3 -m verl.trainer.main_ppo \
@@ -122,9 +116,5 @@ python3 -m verl.trainer.main_ppo \
   "trainer.rollout_data_dir=${ROLLOUT_DIR}" \
   "trainer.validation_data_dir=${VALIDATION_DIR}" \
   "trainer.val_before_train=False" \
-  "actor_rollout_ref.model.fp32_lm_head=${FP32_LM_HEAD}" \
-  "actor_rollout_ref.rollout.calculate_log_probs=${CALCULATE_LOG_PROBS}" \
-  "actor_rollout_ref.actor.use_rollout_log_probs=${USE_ROLLOUT_LOG_PROBS}" \
-  "actor_rollout_ref.actor.recompute_log_prob_for_metrics=${RECOMPUTE_LOG_PROB_FOR_METRICS}" \
   $( [[ "${ENABLE_THINKING_MODE}" == "True" ]] && echo "actor_rollout_ref.rollout.thinking_mode.enable=True" ) \
   2>&1 | tee "${LOG_FILE}"

@@ -152,7 +152,7 @@ actor_rollout_ref:
 
     # Compute the LM head (output projection) in fp32 on the trainer (actor + ref) and in the vLLM rollout.
     # Both sides upcast the same bf16 weights at matmul time, so the head adds no train/inference mismatch.
-    fp32_lm_head: false
+    fp32_lm_head: true
 
   # actor configs
   actor:
@@ -213,8 +213,8 @@ actor_rollout_ref:
     clip_ratio_c: 3.0
 
     # Use the rollout engine's log-prob of each sampled token as pi_old in the PPO ratio, instead of
-    # recomputing it with the FSDP actor. Needs rollout.calculate_log_probs=True (vLLM rollout only).
-    use_rollout_log_probs: false
+    # recomputing it with the FSDP actor. Needs rollout.calculate_log_probs=True (sync vLLM rollout only).
+    use_rollout_log_probs: true
 
     # With use_rollout_log_probs: still run the FSDP forward over the batch, only to log entropy and
     # trainer-vs-rollout agreement (rollout_corr/*). Not used in the loss.
@@ -578,7 +578,7 @@ actor_rollout_ref:
 
     # Return the rollout engine's log-prob of each sampled token as rollout_log_probs. On its own it only
     # feeds the rollout_corr/* metrics; actor.use_rollout_log_probs also uses it as pi_old.
-    calculate_log_probs: False
+    calculate_log_probs: True
 
     # profiler configs
     profiler:
