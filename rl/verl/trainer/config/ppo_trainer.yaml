@@ -216,9 +216,10 @@ actor_rollout_ref:
     # recomputing it with the FSDP actor. Needs rollout.calculate_log_probs=True (sync vLLM rollout only).
     use_rollout_log_probs: true
 
-    # With use_rollout_log_probs: still run the FSDP forward over the batch, only to log entropy and
-    # trainer-vs-rollout agreement (rollout_corr/*). Not used in the loss.
-    recompute_log_prob_for_metrics: true
+    # Debugging aid. With use_rollout_log_probs: also run the FSDP forward over the batch, only to log
+    # trainer-vs-rollout agreement (rollout_corr/*) and exact entropy (actor/entropy). Not used in the loss;
+    # costs ~5% of step time. Entropy is still estimated for free as rollout_corr/rollout_neg_log_prob_mean.
+    recompute_log_prob_for_metrics: false
 
     # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
     loss_agg_mode: token-mean

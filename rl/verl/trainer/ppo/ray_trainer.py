@@ -1650,7 +1650,7 @@ class RayPPOTrainer:
                             "actor.use_rollout_log_probs=True but this rollout path returned no rollout_log_probs"
                         )
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        if not use_rollout_log_probs or actor_cfg.get("recompute_log_prob_for_metrics", True):
+                        if not use_rollout_log_probs or actor_cfg.get("recompute_log_prob_for_metrics", False):
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
