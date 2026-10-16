@@ -15,6 +15,7 @@
 
 from typing import List
 
+import torch
 from msgspec import field
 from packaging import version as vs
 from vllm.lora.models import LoRAModel
@@ -203,3 +204,82 @@ class VLLMHijack:
 def is_version_ge(pkg: str = "vllm", minver: str = "0.7.3"):
     """check if the package version is greater than or equal to the minimum version"""
     return vs.parse(get_version(pkg)) >= vs.parse(minver)
+
+
+def patch_vllm_fp32_lm_head():
+    """Run vLLM's LM-head matmul in fp32 (actor_rollout_ref.model.fp32_lm_head=True).
+
+    vLLM has no option for this, so LogitsProcessor._get_logits is patched at class level, in the rollout
+    worker before the engine is built. That covers the V0 and V1 engines, sync and async rollout, eager and
+    CUDA-graph mode (both engines compute logits outside the captured graph), tied and untied heads, and
+    TP > 1 (the per-rank vocab shard is gathered exactly as before). The stored weights stay bf16 and are
+    upcast at matmul time -- the same operands as the trainer-side fp32 head in fsdp_workers -- so the head
+    adds no trainer<->rollout mismatch. Quantized heads keep vLLM's own path. LoRA wraps the processor in a
+    different class (LogitsProcessorWithLoRA) that this does not reach; ray_trainer rejects that combination.
+    """
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
+
+    if getattr(LogitsProcessor, "_verl_fp32_lm_head", False):
+        return
+    original_get_logits = LogitsProcessor._get_logits
+    logged = False
+
+    def _get_logits(self, hidden_states, lm_head, embedding_bias):
+        nonlocal logged
+        if not isinstance(getattr(lm_head, "quant_method", None), UnquantizedEmbeddingMethod):
+            return original_get_logits(self, hidden_states, lm_head, embedding_bias)
+        logits = torch.nn.functional.linear(
+            hidden_states.float(),
+            lm_head.weight.float(),
+            None if embedding_bias is None else embedding_bias.float(),
+        )
+        # Same as vLLM's _get_logits from here on: gather for TP, drop vocab padding.
+        logits = self._gather_logits(logits)
+        if logits is not None:
+            logits = logits[..., : self.org_vocab_size]
+            if not logged:
+                logged = True
+                print(f"[fp32_lm_head] vLLM logits dtype={logits.dtype} (head weight dtype={lm_head.weight.dtype})")
+        return logits
+
+    LogitsProcessor._get_logits = _get_logits
+    LogitsProcessor._verl_fp32_lm_head = True
+
+
+def patch_vllm_v1_sampler_logprobs_with_temperature():
+    """Make the vLLM V1 sampler return the sampled token's log-prob under softmax(logits / T).
+
+    With actor.use_rollout_log_probs the rollout log-prob is pi_old in the PPO ratio, so it must mean what the
+    trainer computes: log_softmax(logits / T)[token]. The V0 sampler already returns that (it divides by T
+    before log_softmax); the V1 sampler of vLLM < 0.10 returns log-probs of the raw logits, i.e. ignores T.
+    Callers only apply this when T != 1 (at T == 1 both engines already agree). Newer vLLM exposes the same
+    thing as logprobs_mode="processed_logprobs", which vLLMRollout uses instead when available.
+    """
+    from vllm.v1.sample.sampler import Sampler
+
+    if getattr(Sampler, "_verl_logprobs_with_temperature", False):
+        return
+    original_forward = Sampler.forward
+    original_compute_logprobs = Sampler.compute_logprobs
+
+    def forward(self, logits, sampling_metadata):
+        # compute_logprobs runs first thing inside forward; hand it this batch's per-request temperatures.
+        self._verl_temperature = None if sampling_metadata.all_greedy else sampling_metadata.temperature
+        try:
+            return original_forward(self, logits, sampling_metadata)
+        finally:
+            self._verl_temperature = None
+
+    def compute_logprobs(self, logits):
+        temperature = getattr(self, "_verl_temperature", None)
+        if temperature is not None:
+            # Greedy rows carry temperature -1 in V1: leave them unscaled. Divide out of place -- the same
+            # logits tensor is sampled from afterwards.
+            temperature = torch.where(temperature > 0, temperature, torch.ones_like(temperature))
+            logits = logits.float() / temperature.unsqueeze(1)
+        return original_compute_logprobs(self, logits)
+
+    Sampler.forward = forward
+    Sampler.compute_logprobs = compute_logprobs
+    Sampler._verl_logprobs_with_temperature = True

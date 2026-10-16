@@ -150,6 +150,10 @@ actor_rollout_ref:
     # Whether to enable loading a remote code model
     trust_remote_code: false
 
+    # Compute the LM head (output projection) in fp32 on the trainer (actor + ref) and in the vLLM rollout.
+    # Both sides upcast the same bf16 weights at matmul time, so the head adds no train/inference mismatch.
+    fp32_lm_head: false
+
   # actor configs
   actor:
 
@@ -207,6 +211,14 @@ actor_rollout_ref:
 
     # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
     clip_ratio_c: 3.0
+
+    # Use the rollout engine's log-prob of each sampled token as pi_old in the PPO ratio, instead of
+    # recomputing it with the FSDP actor. Needs rollout.calculate_log_probs=True (vLLM rollout only).
+    use_rollout_log_probs: false
+
+    # With use_rollout_log_probs: still run the FSDP forward over the batch, only to log entropy and
+    # trainer-vs-rollout agreement (rollout_corr/*). Not used in the loss.
+    recompute_log_prob_for_metrics: true
 
     # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
     loss_agg_mode: token-mean
@@ -564,7 +576,8 @@ actor_rollout_ref:
       # Format of the multi-turn interaction. Options: hermes, llama3_json, ...
       format: hermes
 
-    # support logging rollout prob for debugging purpose
+    # Return the rollout engine's log-prob of each sampled token as rollout_log_probs. On its own it only
+    # feeds the rollout_corr/* metrics; actor.use_rollout_log_probs also uses it as pi_old.
     calculate_log_probs: False
 
     # profiler configs
