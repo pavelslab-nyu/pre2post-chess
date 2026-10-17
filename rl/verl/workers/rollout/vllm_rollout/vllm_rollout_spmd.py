@@ -26,6 +26,7 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 
+import dataclasses
 import logging
 import os
 import pickle
@@ -53,6 +54,7 @@ from vllm.worker.worker_base import WorkerWrapperBase
 from verl import DataProto
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
+from verl.utils.vllm_utils import patch_vllm_fp32_lm_head, patch_vllm_v1_sampler_logprobs_with_temperature
 from verl.workers.rollout.base import BaseRollout
 
 logger = logging.getLogger(__file__)
@@ -155,6 +157,20 @@ class vLLMRollout(BaseRollout):
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
+
+        # fp32 LM head, matched with the trainer-side head (actor_rollout_ref.model.fp32_lm_head).
+        if kwargs.get("fp32_lm_head", False):
+            patch_vllm_fp32_lm_head()
+        # Rollout log-probs must be log_softmax(logits / T), like the trainer's. That already holds at T == 1
+        # and on the V0 engine; the V1 sampler reports raw-logit log-probs, so it needs help at T != 1.
+        if config.get("calculate_log_probs", False) and float(config.get("temperature", 1.0)) != 1.0:
+            from vllm.engine.arg_utils import EngineArgs
+
+            if "logprobs_mode" in {f.name for f in dataclasses.fields(EngineArgs)}:
+                # vLLM >= 0.10 has this built in (not exercised here: the chess_rl env is 0.8.5).
+                engine_kwargs.setdefault("logprobs_mode", "processed_logprobs")
+            else:
+                patch_vllm_v1_sampler_logprobs_with_temperature()
 
         self.inference_engine = LLM(
             model=model_path,
@@ -405,26 +421,9 @@ class vLLMRollout(BaseRollout):
 
 # https://github.com/vllm-project/vllm/issues/13175
 def _monkey_patch_compute_logits(model, vocab_size: int):
-    # Force fp32 lm_head matmul on the generator. Paired with the matching
-    # trainer-side fp32 lm_head matmul, this makes the head contribute zero
-    # additional trainer<->generator logit drift (operands are bf16 on both
-    # sides; both sides upcast identically before the matmul).
-    lp = getattr(model, "logits_processor", None)
-    if lp is not None and hasattr(lp, "_get_logits"):
-        org_vocab_size = lp.org_vocab_size
-
-        def _fp32_get_logits(self, hidden_states, lm_head, embedding_bias):
-            logits = torch.nn.functional.linear(
-                hidden_states.float(),
-                lm_head.weight.float(),
-                None if embedding_bias is None else embedding_bias.float(),
-            )
-            logits = self._gather_logits(logits)
-            if logits is not None:
-                logits = logits[..., :org_vocab_size]
-            return logits
-
-        lp._get_logits = MethodType(_fp32_get_logits, lp)
+    # The async server has always forced the fp32 lm_head matmul; it now shares the
+    # class-level patch with the sync vLLMRollout (see patch_vllm_fp32_lm_head).
+    patch_vllm_fp32_lm_head()
 
     original_compute_logits = model.compute_logits
 

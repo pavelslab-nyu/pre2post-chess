@@ -14,6 +14,10 @@ chess as a fully controllable, verifiable testbed. The pipeline (figure above) i
 - **(c) Mechanism analysis** — is RL just sharpening the SFT policy, or discovering new
   behaviors? (ground-truth amplification vs. tail discovery).
 
+## 📢 Updates
+
+- **2026-10-16** — RL now fixes the trainer–inference mismatch by default (fp32 LM head on both the trainer and vLLM, and vLLM's own log-probs as π_old in the PPO ratio); configs it can't support (e.g. top-p < 1, async or SGLang rollout, LoRA) stop at startup with an error naming the flag to set to `false`.
+
 ---
 
 ## 🗺️ Repository structure

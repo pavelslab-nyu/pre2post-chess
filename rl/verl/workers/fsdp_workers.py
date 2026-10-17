@@ -101,14 +101,79 @@ def _left_pad_2d(seqs: list[list[int]], pad_id: int, device: torch.device) -> to
 
 def _extract_response_tokens(row: torch.Tensor, eos_id: int, pad_id: int) -> list[int]:
     """Strip leading/trailing pads and stop (inclusive) at first EOS."""
-    tokens = []
-    for t in row.tolist():
+    return _extract_response_tokens_and_logprobs(row, None, eos_id=eos_id, pad_id=pad_id)[0]
+
+
+def _extract_response_tokens_and_logprobs(
+    row: torch.Tensor, logprob_row, eos_id: int, pad_id: int
+) -> tuple[list[int], list[float] | None, int]:
+    """_extract_response_tokens, carrying each kept token's rollout log-prob along with it.
+
+    Both must filter identically, so _extract_response_tokens is this with logprob_row=None (log-probs then
+    come back as None). Also counts *generated* tokens dropped by the pad rule: vLLMRollout pads
+    rollout_log_probs with -1, so a skipped position holding a real log-prob was sampled by the model
+    (e.g. <bos> when pad_id == bos_id).
+    """
+    lps = logprob_row.tolist() if logprob_row is not None else None
+    tokens, logprobs, n_dropped = [], ([] if lps is not None else None), 0
+    for k, t in enumerate(row.tolist()):
         if t == pad_id or t == 0: # patch
+            if lps is not None and lps[k] != -1.0:
+                n_dropped += 1
             continue  # skip pads (left-padded output may have them at start)
         tokens.append(t)
+        if lps is not None:
+            logprobs.append(lps[k])
         if t == eos_id:
             break
-    return tokens
+    return tokens, logprobs, n_dropped
+
+
+def _head(logprobs: list[float] | None, n: int) -> list[float] | None:
+    """logprobs[:n], or None when log-probs are not being collected. Sliced in lockstep with the tokens."""
+    return None if logprobs is None else logprobs[:n]
+
+
+def _rollout_log_probs_tensor(states, policy_mask: torch.Tensor, length: int, device) -> torch.Tensor:
+    """Right-pad each sample's per-token rollout log-probs to [B, length] (float32).
+
+    Env/opponent tokens hold 0.0 -- they are masked out of the loss by response_mask (= policy_mask). A model
+    token whose log-prob was never recorded holds NaN, which the check below turns into an error instead of a
+    silently wrong PPO ratio.
+    """
+    out = torch.zeros((len(states), length), dtype=torch.float32, device=device)
+    for i, s in enumerate(states):
+        assert len(s.response_logprobs) == len(s.response_tokens), f"sample {i}: log-probs out of step with tokens"
+        lp = s.response_logprobs[:length]
+        if lp:
+            out[i, : len(lp)] = torch.tensor(lp, dtype=torch.float32, device=device)
+    policy = policy_mask.bool()
+    assert torch.isfinite(out[policy]).all(), "a model-generated token has no rollout log-prob"
+    assert (out[policy] <= 1e-3).all(), "rollout log-probs must be <= 0"
+    return out
+
+
+def _enable_fp32_lm_head(model: torch.nn.Module) -> None:
+    """Compute the LM head (output projection) in fp32 on the trainer side.
+
+    dp_actor runs the forward under torch.autocast(bf16), and autocast casts F.linear operands back to bf16,
+    so upcasting the operands alone is a no-op (the earlier, unconditional version of this patch was).
+    Autocast is therefore disabled inside the head. The weights stay bf16 under FSDP mixed precision and are
+    upcast at matmul time, exactly like the vLLM side (verl.utils.vllm_utils.patch_vllm_fp32_lm_head), so
+    the head adds no trainer<->rollout mismatch. Only `forward` is replaced: module structure, state-dict
+    keys and FSDP wrapping are unchanged, and tied embeddings keep sharing one parameter.
+    """
+    head = model.get_output_embeddings()
+    if not isinstance(head, torch.nn.Linear):
+        raise ValueError(f"fp32_lm_head expects the output embedding to be nn.Linear, got {type(head).__name__}")
+
+    def _fp32_forward(self, x):
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            return torch.nn.functional.linear(
+                x.float(), self.weight.float(), None if self.bias is None else self.bias.float()
+            )
+
+    head.forward = MethodType(_fp32_forward, head)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +255,7 @@ class _SampleState:
         self.finished: bool = False
         self.prompt_token_count: int = len(prompt_ids)  # prompt size in tokens
         self.env_replies_used: list = []          # env reply texts actually consumed
+        self.response_logprobs: list[float] = []  # rollout log-prob per response token (0.0 for env tokens)
         # Pre-recorded env replies queue; popped one-by-one each env call
         if isinstance(env_replies, list):
             self.env_replies: list = list(env_replies)
@@ -198,16 +264,23 @@ class _SampleState:
         else:
             self.env_replies = []
 
-    def append_model(self, tokens: list[int]) -> None:
+    def append_model(self, tokens: list[int], logprobs: list[float] | None = None) -> None:
         self.ctx.extend(tokens)
         self.response_tokens.extend(tokens)
         self.policy_mask.extend([1] * len(tokens))
         self.n_model_tokens += len(tokens)
+        if logprobs is None:
+            # Not collected. NaN, so _rollout_log_probs_tensor rejects it if collection was expected.
+            self.response_logprobs.extend([float("nan")] * len(tokens))
+        else:
+            assert len(logprobs) == len(tokens), "one rollout log-prob per model token"
+            self.response_logprobs.extend(logprobs)
 
     def append_env(self, tokens: list[int]) -> None:
         self.ctx.extend(tokens)
         self.response_tokens.extend(tokens)
         self.policy_mask.extend([0] * len(tokens))
+        self.response_logprobs.extend([0.0] * len(tokens))  # masked out of the loss
         # env tokens do NOT count toward n_model_tokens
     
 
@@ -440,19 +513,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
 
-            # fp32 lm_head matmul. Matches the generator-side fp32 head patch so
-            # the head contributes zero trainer<->generator logit drift. Patch the
-            # forward instance attribute (not the module structure) so FSDP weight
-            # sync keys remain unchanged.
-            lm_head = getattr(actor_module, "lm_head", None)
-            if isinstance(lm_head, torch.nn.Linear):
-                def _fp32_lm_head_forward(self, x):
-                    return torch.nn.functional.linear(
-                        x.float(),
-                        self.weight.float(),
-                        None if self.bias is None else self.bias.float(),
-                    )
-                lm_head.forward = MethodType(_fp32_lm_head_forward, lm_head)
+            # Opt-in fp32 LM head for the actor and the ref model (both built here), matched with the vLLM
+            # side. With the flag off nothing is patched, which is numerically identical to the old
+            # unconditional patch: under dp_actor's bf16 autocast that one never took effect.
+            if self.config.model.get("fp32_lm_head", False):
+                if use_fused_kernels:
+                    # The fused kernel computes log-probs from the hidden states itself and never calls the head.
+                    raise ValueError("actor_rollout_ref.model.fp32_lm_head does not support use_fused_kernels=True")
+                _enable_fp32_lm_head(actor_module)
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -643,6 +711,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 model_hf_config=self.actor_model_config,
                 device_mesh=rollout_device_mesh,
                 trust_remote_code=trust_remote_code,
+                fp32_lm_head=self.config.model.get("fp32_lm_head", False),
                 **lora_kwargs,
             )
 
@@ -949,6 +1018,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # round_max_tokens: int = int(
         #     self.config.rollout.multi_turn.get("round_max_tokens", 128)
         # )
+        # Carry vLLM's sampled-token log-probs through the turns (rollout.calculate_log_probs).
+        collect_logprobs = bool(self.config.rollout.get("calculate_log_probs", False))
+        n_dropped_generated = 0
+        # vLLM rejects (V0: raises on) a request longer than max_model_len. Opponent replies are added outside
+        # the model-token budget, so a long prompt plus a near-full budget can overflow it; such samples stop
+        # taking turns instead (same limit as vLLMRollout).
+        max_ctx_len: int = int(
+            self.config.rollout.get("max_model_len", None) or self.config.rollout.prompt_length + max_model_tokens
+        )
 
         timing_generate = {}
         with self.rollout_sharding_manager:
@@ -1010,6 +1088,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         if not s.finished
                         and s.n_env_calls < max_env_calls
                         and s.n_model_tokens < max_model_tokens
+                        and len(s.ctx) < max_ctx_len
                     ]
                     # print(f"[DEBUG multi-turn] length of active_idx={len(active_idx)}")
                     if not active_idx:
@@ -1037,12 +1116,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
                     out = self.rollout.generate_sequences(prompts=dp_active, **seg_kwargs)
                     # print(f"[DEBUG multi-turn] out.batch keys={list(out.batch.keys())}")
+                    out_logprobs = out.batch["rollout_log_probs"] if collect_logprobs else None
 
                     # Process each active sample's output
                     for j, i in enumerate(active_idx):
                         state = states[i]
                         raw_row = out.batch["responses"][j]
-                        tokens = _extract_response_tokens(raw_row, eos_id=eos_id, pad_id=pad_id)
+                        tokens, logprobs, n_drop = _extract_response_tokens_and_logprobs(
+                            raw_row, None if out_logprobs is None else out_logprobs[j], eos_id=eos_id, pad_id=pad_id
+                        )
+                        n_dropped_generated += n_drop
                         # print(f"[DEBUG multi-turn] tokens={tokens}")
                         # decoded = self.tokenizer.decode(tokens) #, skip_special_tokens=False
                         # print(f"[DEBUG multi-turn] decoded={decoded}")
@@ -1060,6 +1143,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         if remaining < len(tokens):
                             print(f"[warning multi-turn] tokens length={len(tokens)} is greater than remaining={remaining}")
                         tokens = tokens[:remaining]
+                        logprobs = _head(logprobs, remaining)
                         if not tokens:
                             state.finished = True
                             continue
@@ -1071,7 +1155,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         if hit_call:
                             # Keep everything up to and including <call_env>
                             cut = tokens.index(call_env_id) + 1
-                            state.append_model(tokens[:cut])
+                            state.append_model(tokens[:cut], _head(logprobs, cut))
                             state.n_env_calls += 1
 
                             # Get environment observation
@@ -1102,7 +1186,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                                 # print(f"[DEBUG multi-turn] max_env_calls={max_env_calls} reached for sample {i}")
                                 state.finished = True
                         else:
-                            state.append_model(tokens)
+                            state.append_model(tokens, logprobs)
                             # if hit_eos:
                                 # print(f"[DEBUG multi-turn] EOS hit for sample {i}, finishing")
                             # else:
@@ -1110,6 +1194,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                             state.finished = True
 
             log_gpu_memory_usage("After rollout generation", logger=logger)
+            if n_dropped_generated:
+                print(f"[warning multi-turn] dropped {n_dropped_generated} generated pad-id tokens from responses; "
+                      f"tokens after them in the same turn were sampled with them in context")
+            n_ctx_limited = sum(1 for s in states if not s.finished and len(s.ctx) >= max_ctx_len)
+            if n_ctx_limited:
+                print(f"[warning multi-turn] {n_ctx_limited} samples stopped at vLLM max_model_len={max_ctx_len}")
 
             # Restore original sample order so states aligns with prompts.batch
             restored = [None] * len(states)
@@ -1201,6 +1291,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 },
                 batch_size=len(states),
             )
+            if collect_logprobs:
+                batch["rollout_log_probs"] = _rollout_log_probs_tensor(states, policy_mask, resp_len, device)
             non_tensor = dict(prompts.non_tensor_batch)
             non_tensor["n_env_calls"] = np.array([s.n_env_calls for s in states], dtype=np.int32)
             non_tensor["max_env_calls_used"] = np.array([max_env_calls] * len(states), dtype=np.int32)
@@ -1599,6 +1691,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         max_model_tokens: int = int(
             self.config.rollout.get("response_length", 1024)
         )
+        # Carry vLLM's sampled-token log-probs through the turns (rollout.calculate_log_probs).
+        collect_logprobs = bool(self.config.rollout.get("calculate_log_probs", False))
+        n_dropped_generated = 0
+        # vLLM rejects (V0: raises on) a request longer than max_model_len. Opponent replies are added outside
+        # the model-token budget, so a long prompt plus a near-full budget can overflow it; such samples stop
+        # taking turns instead (same limit as vLLMRollout).
+        max_ctx_len: int = int(
+            self.config.rollout.get("max_model_len", None) or self.config.rollout.prompt_length + max_model_tokens
+        )
 
         timing_generate = {}
         with self.rollout_sharding_manager:
@@ -1634,6 +1735,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         if not s.finished
                         and s.n_env_calls < max_env_calls
                         and s.n_model_tokens < max_model_tokens
+                        and len(s.ctx) < max_ctx_len
                     ]
                     if not active_idx:
                         break
@@ -1657,11 +1759,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     }
 
                     out = self.rollout.generate_sequences(prompts=dp_active, **seg_kwargs)
+                    out_logprobs = out.batch["rollout_log_probs"] if collect_logprobs else None
 
                     for j, i in enumerate(active_idx):
                         state = states[i]
                         raw_row = out.batch["responses"][j]
-                        tokens = _extract_response_tokens(raw_row, eos_id=eos_id, pad_id=pad_id)
+                        tokens, logprobs, n_drop = _extract_response_tokens_and_logprobs(
+                            raw_row, None if out_logprobs is None else out_logprobs[j], eos_id=eos_id, pad_id=pad_id
+                        )
+                        n_dropped_generated += n_drop
 
                         if not tokens:
                             state.finished = True
@@ -1670,6 +1776,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         # Clip to this sample's own remaining global budget
                         remaining = max_model_tokens - state.n_model_tokens
                         tokens = tokens[:remaining]
+                        logprobs = _head(logprobs, remaining)
                         if not tokens:
                             state.finished = True
                             continue
@@ -1679,15 +1786,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         # Strip EOS so boundary detection works on content tokens only.
                         # The model (pretrained to generate full games) often emits
                         # multiple moves + EOS in one shot; we must truncate to the first move.
+                        # Every cut below keeps a prefix of what vLLM generated, so slicing the
+                        # log-probs the same way keeps them exact.
                         if hit_eos:
                             tokens_body = tokens[:-1]
+                            logprobs_body = _head(logprobs, len(tokens) - 1)
                             if not tokens_body:
                                 # Only EOS was generated — keep it so policy_mask is non-empty
-                                state.append_model(tokens)  # [eos_id]
+                                state.append_model(tokens, logprobs)  # [eos_id]
                                 state.finished = True
                                 continue
                         else:
                             tokens_body = tokens
+                            logprobs_body = logprobs
 
                         # Scan for the first complete chess move (same path for EOS and non-EOS)
                         move_end_idx, move_str = _find_move_token_boundary(tokens_body, self.tokenizer)
@@ -1695,13 +1806,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         if move_end_idx is None:
                             # No recognisable move — append everything (without EOS) and finish
                             print(f"[warning no-stop] no move found in round output for sample {i}, finishing")
-                            state.append_model(tokens_body)
+                            state.append_model(tokens_body, logprobs_body)
                             state.finished = True
                             continue
 
                         # Keep only up to (and including) the move boundary
                         move_tokens = tokens_body[:move_end_idx]
-                        state.append_model(move_tokens)
+                        state.append_model(move_tokens, _head(logprobs_body, move_end_idx))
                         state.n_env_calls += 1
 
                         # Fetch env reply
@@ -1721,6 +1832,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                             state.finished = True
 
             log_gpu_memory_usage("After no-stop rollout generation", logger=logger)
+            if n_dropped_generated:
+                print(f"[warning no-stop] dropped {n_dropped_generated} generated pad-id tokens from responses; "
+                      f"tokens after them in the same turn were sampled with them in context")
+            n_ctx_limited = sum(1 for s in states if not s.finished and len(s.ctx) >= max_ctx_len)
+            if n_ctx_limited:
+                print(f"[warning no-stop] {n_ctx_limited} samples stopped at vLLM max_model_len={max_ctx_len}")
 
             # ---- assemble final outputs ----
             resp_len = max((len(s.response_tokens) for s in states), default=1)
@@ -1774,6 +1891,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 },
                 batch_size=len(states),
             )
+            if collect_logprobs:
+                batch["rollout_log_probs"] = _rollout_log_probs_tensor(states, policy_mask, resp_len, device)
             non_tensor = dict(prompts.non_tensor_batch)
             non_tensor["n_env_calls"]               = np.array([s.n_env_calls for s in states], dtype=np.int32)
             non_tensor["max_env_calls_used"]         = np.array([max_env_calls] * len(states), dtype=np.int32)

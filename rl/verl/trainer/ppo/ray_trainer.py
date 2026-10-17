@@ -222,6 +222,50 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def compute_rollout_log_prob_metrics(
+    rollout_log_probs: torch.Tensor,
+    trainer_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+) -> dict:
+    """How closely the trainer's log-probs match the rollout engine's for the same sampled tokens.
+
+    Only response_mask tokens count -- for multi-turn chess that is policy_mask, so opponent/env tokens (which
+    have no rollout log-prob) are excluded. delta = log pi_trainer - log pi_rollout is the log PPO ratio at the
+    start of the update when pi_old is the rollout log-prob (actor.use_rollout_log_probs).
+    """
+    mask = response_mask.bool()
+    if not mask.any():
+        return {}
+    lp_rollout = rollout_log_probs[mask].double()
+    lp_trainer = trainer_log_probs[mask].double()
+    delta = lp_trainer - lp_rollout
+    ratio = torch.exp(delta)
+    prob_abs_diff = (torch.exp(lp_trainer) - torch.exp(lp_rollout)).abs()
+    seq_delta = ((trainer_log_probs - rollout_log_probs).double() * mask).sum(dim=-1)[mask.any(dim=-1)]
+    metrics = {
+        "rollout_corr/log_ratio_abs_mean": delta.abs().mean().item(),
+        "rollout_corr/log_ratio_abs_max": delta.abs().max().item(),
+        # KL(pi_rollout || pi_trainer) on the rollout's own samples: k1 is unbiased, k3 is >= 0 per token.
+        "rollout_corr/kl_k1": (-delta).mean().item(),
+        "rollout_corr/kl_k3": (ratio - 1 - delta).mean().item(),
+        # Tokens whose ratio is already outside the PPO clip range before any update.
+        "rollout_corr/ratio_outside_clip_frac": ((ratio < 1 - clip_ratio_low) | (ratio > 1 + clip_ratio_high))
+        .double()
+        .mean()
+        .item(),
+        "rollout_corr/prob_abs_diff_mean": prob_abs_diff.mean().item(),
+        "rollout_corr/prob_abs_diff_max": prob_abs_diff.max().item(),
+        "rollout_corr/seq_log_ratio_abs_mean": seq_delta.abs().mean().item(),
+    }
+    if lp_rollout.numel() > 1:
+        corr = torch.corrcoef(torch.stack([torch.exp(lp_rollout), torch.exp(lp_trainer)]))[0, 1]
+        if torch.isfinite(corr):
+            metrics["rollout_corr/prob_pearson"] = corr.item()
+    return metrics
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator,
@@ -699,6 +743,37 @@ class RayPPOTrainer:
             assert config.algorithm.adv_estimator in [AdvantageEstimator.GRPO], (
                 "only GRPO is tested for multi-turn with tool"
             )
+
+        # check rollout log-probs as pi_old and the fp32 LM head
+        rollout_cfg = config.actor_rollout_ref.rollout
+        if config.actor_rollout_ref.actor.get("use_rollout_log_probs", False):
+            if not rollout_cfg.get("calculate_log_probs", False):
+                raise ValueError("actor.use_rollout_log_probs=True needs actor_rollout_ref.rollout.calculate_log_probs=True")
+            if rollout_cfg.name != "vllm" or rollout_cfg.get("mode", "sync") != "sync":
+                raise ValueError("actor.use_rollout_log_probs is implemented for the sync vLLM rollout only")
+            # pi_old must be log_softmax(logits / T)[token], which is what the trainer computes. Truncation or
+            # penalties change the sampling distribution in ways the trainer does not reproduce (and vLLM V0/V1
+            # report them differently), so they are rejected rather than silently mismatched.
+            if not rollout_cfg.temperature > 0:
+                raise ValueError("actor.use_rollout_log_probs needs rollout.temperature > 0")
+            if float(rollout_cfg.get("top_p", 1.0)) != 1.0 or int(rollout_cfg.get("top_k", -1)) > 0:
+                raise ValueError("actor.use_rollout_log_probs needs rollout.top_p=1 and rollout.top_k=-1")
+            for key, neutral in (
+                ("min_p", 0.0),
+                ("presence_penalty", 0.0),
+                ("frequency_penalty", 0.0),
+                ("repetition_penalty", 1.0),
+                ("min_tokens", 0),
+            ):
+                if rollout_cfg.get(key, None) is not None and float(rollout_cfg[key]) != neutral:
+                    raise ValueError(f"actor.use_rollout_log_probs needs rollout.{key}={neutral}")
+        if config.actor_rollout_ref.model.get("fp32_lm_head", False):
+            if rollout_cfg.name not in ("vllm", "hf"):
+                raise ValueError("actor_rollout_ref.model.fp32_lm_head is implemented for the vLLM and HF rollouts only")
+            if config.actor_rollout_ref.model.get("lora_rank", 0) > 0:
+                raise ValueError("actor_rollout_ref.model.fp32_lm_head does not support LoRA (vLLM's LoRA logits path)")
+            if config.actor_rollout_ref.model.get("use_fused_kernels", False):
+                raise ValueError("actor_rollout_ref.model.fp32_lm_head does not support use_fused_kernels=True")
 
         print("[validate_config] All configuration checks passed successfully!")
 
@@ -1563,41 +1638,59 @@ class RayPPOTrainer:
                             "training/ref_solve_none_ratio": ref_solve_none / len(unique_uids),
                             "training/ref_solve_all_ratio": ref_solve_all / len(unique_uids),
                         })
-                    # recompute old_log_probs
+                    # old_log_probs = pi_old in the PPO ratio. By default the FSDP actor recomputes them. With
+                    # actor.use_rollout_log_probs, pi_old is the rollout engine's own log-prob of each sampled token
+                    # (the behavior policy); the FSDP forward then runs only if actor.recompute_log_prob_for_metrics
+                    # is on, to log entropy and trainer-vs-rollout agreement (rollout_corr/*), not for the loss.
+                    actor_cfg = self.config.actor_rollout_ref.actor
+                    use_rollout_log_probs = actor_cfg.get("use_rollout_log_probs", False)
+                    has_rollout_log_probs = "rollout_log_probs" in batch.batch.keys()
+                    if use_rollout_log_probs and not has_rollout_log_probs:
+                        raise RuntimeError(
+                            "actor.use_rollout_log_probs=True but this rollout path returned no rollout_log_probs"
+                        )
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                        if not use_rollout_log_probs or actor_cfg.get("recompute_log_prob_for_metrics", False):
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                            if use_rollout_log_probs:
+                                trainer_log_probs = old_log_prob.batch.pop("old_log_probs")
+                            else:
+                                trainer_log_probs = old_log_prob.batch["old_log_probs"]
+                            batch = batch.union(old_log_prob)
 
-                        if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
-                            rollout_old_log_probs = batch.batch["rollout_log_probs"]
-                            actor_old_log_probs = batch.batch["old_log_probs"]
-                            attention_mask = batch.batch["attention_mask"]
-                            responses = batch.batch["responses"]
-                            response_length = responses.size(1)
-                            response_mask = attention_mask[:, -response_length:]
+                            if has_rollout_log_probs:
+                                clip_ratio_low = actor_cfg.get("clip_ratio_low", None)
+                                clip_ratio_high = actor_cfg.get("clip_ratio_high", None)
+                                metrics.update(
+                                    compute_rollout_log_prob_metrics(
+                                        rollout_log_probs=batch.batch["rollout_log_probs"],
+                                        trainer_log_probs=trainer_log_probs,
+                                        response_mask=batch.batch["response_mask"],
+                                        clip_ratio_low=clip_ratio_low if clip_ratio_low is not None else actor_cfg.clip_ratio,
+                                        clip_ratio_high=clip_ratio_high if clip_ratio_high is not None else actor_cfg.clip_ratio,
+                                    )
+                                )
 
-                            rollout_probs = torch.exp(rollout_old_log_probs)
-                            actor_probs = torch.exp(actor_old_log_probs)
-                            rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
-                            rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
-                            rollout_probs_diff_max = torch.max(rollout_probs_diff)
-                            rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
-                            rollout_probs_diff_std = torch.std(rollout_probs_diff)
-                            metrics.update(
-                                {
-                                    "training/rollout_probs_diff_max": rollout_probs_diff_max.detach().item(),
-                                    "training/rollout_probs_diff_mean": rollout_probs_diff_mean.detach().item(),
-                                    "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
-                                }
-                            )
+                        if use_rollout_log_probs:
+                            batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"].clone()
+                            # update_policy reads meta_info["temperature"]; it normally arrives with the
+                            # compute_log_prob output, which is skipped when recompute_log_prob_for_metrics=False.
+                            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                        if has_rollout_log_probs:
+                            # Mean -log pi_rollout of the sampled tokens: an unbiased estimate of the rollout policy's
+                            # per-token entropy that needs no forward pass.
+                            policy_tokens = batch.batch["response_mask"].bool()
+                            if policy_tokens.any():
+                                metrics["rollout_corr/rollout_neg_log_prob_mean"] = (
+                                    -batch.batch["rollout_log_probs"][policy_tokens].mean().item()
+                                )
 
                     if self.use_reference_policy:
                         # compute reference log_prob
