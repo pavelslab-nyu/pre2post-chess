@@ -110,9 +110,11 @@ def _extract_response_tokens_and_logprobs(
     """_extract_response_tokens, carrying each kept token's rollout log-prob along with it.
 
     Both must filter identically, so _extract_response_tokens is this with logprob_row=None (log-probs then
-    come back as None). Also counts *generated* tokens dropped by the pad rule: vLLMRollout pads
-    rollout_log_probs with -1, so a skipped position holding a real log-prob was sampled by the model
-    (e.g. <bos> when pad_id == bos_id).
+    come back as None). vLLM right-pads its output, so the first pad-id token ends the response. A pad-id
+    token the model generated itself (e.g. <bos> when pad_id == bos_id) also ends it there: splicing it out
+    would leave the following tokens scored in a different context than they were sampled in. Returns how
+    many responses were cut this way (vLLMRollout pads rollout_log_probs with -1, so a real log-prob at that
+    position means the model sampled the token).
     """
     lps = logprob_row.tolist() if logprob_row is not None else None
     tokens, logprobs, n_dropped = [], ([] if lps is not None else None), 0
@@ -120,7 +122,7 @@ def _extract_response_tokens_and_logprobs(
         if t == pad_id or t == 0: # patch
             if lps is not None and lps[k] != -1.0:
                 n_dropped += 1
-            continue  # skip pads (left-padded output may have them at start)
+            break  # padding starts here, or the model generated a pad-id token: end the turn before it
         tokens.append(t)
         if lps is not None:
             logprobs.append(lps[k])
@@ -1195,8 +1197,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             log_gpu_memory_usage("After rollout generation", logger=logger)
             if n_dropped_generated:
-                print(f"[warning multi-turn] dropped {n_dropped_generated} generated pad-id tokens from responses; "
-                      f"tokens after them in the same turn were sampled with them in context")
+                print(f"[warning multi-turn] ended {n_dropped_generated} turns at a generated pad-id token")
             n_ctx_limited = sum(1 for s in states if not s.finished and len(s.ctx) >= max_ctx_len)
             if n_ctx_limited:
                 print(f"[warning multi-turn] {n_ctx_limited} samples stopped at vLLM max_model_len={max_ctx_len}")
@@ -1833,8 +1834,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             log_gpu_memory_usage("After no-stop rollout generation", logger=logger)
             if n_dropped_generated:
-                print(f"[warning no-stop] dropped {n_dropped_generated} generated pad-id tokens from responses; "
-                      f"tokens after them in the same turn were sampled with them in context")
+                print(f"[warning no-stop] ended {n_dropped_generated} turns at a generated pad-id token")
             n_ctx_limited = sum(1 for s in states if not s.finished and len(s.ctx) >= max_ctx_len)
             if n_ctx_limited:
                 print(f"[warning no-stop] {n_ctx_limited} samples stopped at vLLM max_model_len={max_ctx_len}")
