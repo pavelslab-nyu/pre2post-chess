@@ -180,27 +180,43 @@ def _enable_fp32_lm_head(model: torch.nn.Module) -> None:
 # Move-boundary helper (no-stop-token multi-turn)
 # ---------------------------------------------------------------------------
 
-def _find_move_token_boundary(tokens: list[int], tokenizer) -> tuple:
-    """Find the earliest token boundary that completes a chess move.
+# Word prefixes that continue the preceding move instead of starting a new one:
+# the promotion piece ("=Q"; "=" decodes as its own word until the piece
+# arrives) and check / mate marks.
+_MOVE_CONTINUATION_PREFIXES = ("=", "+", "#")
 
-    Decodes token prefixes one token at a time and watches for newly-formed
-    whitespace-delimited words that satisfy ``_is_complete_move``.  This
-    correctly handles moves that span multiple sub-word tokens (e.g. ``Pd2``
-    + ``d4`` → ``Pd2d4``).
+
+def _find_move_token_boundary(tokens: list[int], tokenizer) -> tuple:
+    """Find the token boundary that ends the first complete chess move.
+
+    Decodes token prefixes one token at a time and watches whitespace-delimited
+    words.  A word satisfying ``_is_complete_move`` is only accepted once it is
+    *closed*: a following word starts that is not a continuation of it (does
+    not begin with ``=``, ``+`` or ``#``), or the tokens run out.  This handles
+    moves that span multiple sub-word tokens (``Pd2`` + ``d4`` → ``Pd2d4``) and
+    keeps promotion pieces and check marks: ``P a2 a1`` already parses as
+    ``Pa2a1`` before ``= Q`` arrives, so accepting the shortest parseable
+    prefix cut ``Pa2a1=Q`` to ``Pa2a1`` (scored wrong) and ``Qe4h1+`` to
+    ``Qe4h1``.
 
     Returns:
-        (end_idx, move_str) where ``tokens[:end_idx]`` is the shortest prefix
-        containing a complete move, or ``(None, None)`` if none found.
+        (end_idx, move_str) where ``tokens[:end_idx]`` ends with the full move
+        (promotion piece and +/# included), or ``(None, None)`` if none found.
     """
     from verl.reward_function import _is_complete_move
-    prev_word_set: set = set()
+    prev_words: list[str] = []
     for end in range(1, len(tokens) + 1):
-        text = tokenizer.decode(tokens[:end], skip_special_tokens=False)
-        word_set = set(text.split())
-        for word in word_set - prev_word_set:   # only newly-completed words
-            if _is_complete_move(word):
-                return end, word
-        prev_word_set = word_set
+        words = tokenizer.decode(tokens[:end], skip_special_tokens=False).split()
+        if len(words) > len(prev_words) and not words[-1].startswith(_MOVE_CONTINUATION_PREFIXES):
+            # tokens[end - 1] opened a new word, closing every word before it
+            for word in prev_words:
+                if _is_complete_move(word):
+                    return end - 1, word
+        prev_words = words
+    # Tokens ran out (EOS stripped by the caller, or round budget hit)
+    for word in prev_words:
+        if _is_complete_move(word):
+            return len(tokens), word
     return None, None
 
 
