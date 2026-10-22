@@ -188,7 +188,7 @@ def _enable_fp32_lm_head(model: torch.nn.Module) -> None:
 _MOVE_CONTINUATION_PREFIXES = ("=", "+", "#")
 
 
-def _find_move_token_boundary(tokens: list[int], tokenizer) -> tuple:
+def _find_move_token_boundary(tokens: list[int], tokenizer, call_env_id: int | None = None) -> tuple:
     """Find the token boundary that ends the first complete chess move.
 
     Decodes token prefixes one token at a time and watches whitespace-delimited
@@ -201,9 +201,15 @@ def _find_move_token_boundary(tokens: list[int], tokenizer) -> tuple:
     prefix cut ``Pa2a1=Q`` to ``Pa2a1`` (scored wrong) and ``Qe4h1+`` to
     ``Qe4h1``.
 
+    If the word closing the move is the ``call_env_id`` token (the model wrote
+    ``move <call_env>``), the boundary includes that token, so the env reply
+    appended next follows ``move <call_env>`` as in <call_env>-format training
+    data. Otherwise everything after the move is dropped.
+
     Returns:
         (end_idx, move_str) where ``tokens[:end_idx]`` ends with the full move
-        (promotion piece and +/# included), or ``(None, None)`` if none found.
+        (promotion piece and +/# included; plus a directly following
+        ``<call_env>``), or ``(None, None)`` if none found.
     """
     from verl.reward_function import _is_complete_move
     prev_words: list[str] = []
@@ -213,6 +219,8 @@ def _find_move_token_boundary(tokens: list[int], tokenizer) -> tuple:
             # tokens[end - 1] opened a new word, closing every word before it
             for word in prev_words:
                 if _is_complete_move(word):
+                    if call_env_id is not None and tokens[end - 1] == call_env_id:
+                        return end, word
                     return end - 1, word
         prev_words = words
     # Tokens ran out (EOS stripped by the caller, or round budget hit)
@@ -1698,6 +1706,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         prompts.meta_info.update({"eos_token_id": eos_id, "pad_token_id": pad_id})
 
+        # A <call_env> written right after a move is kept with it (see
+        # _find_move_token_boundary); None when the vocab has no such token.
+        env_token = getattr(self.tokenizer, "env_token", None) or "<call_env>"
+        call_env_id = self.tokenizer.convert_tokens_to_ids(env_token)
+        if call_env_id is None or call_env_id == self.tokenizer.unk_token_id:
+            call_env_id = None
+
         # Hyperparams
         round_max_tokens: int = int(
             self.config.rollout.multi_turn.get("round_max_tokens", 8)
@@ -1818,7 +1833,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                             logprobs_body = logprobs
 
                         # Scan for the first complete chess move (same path for EOS and non-EOS)
-                        move_end_idx, move_str = _find_move_token_boundary(tokens_body, self.tokenizer)
+                        move_end_idx, move_str = _find_move_token_boundary(tokens_body, self.tokenizer, call_env_id)
 
                         if move_end_idx is None:
                             # No recognisable move — append everything (without EOS) and finish
