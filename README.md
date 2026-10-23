@@ -17,6 +17,7 @@ chess as a fully controllable, verifiable testbed. The pipeline (figure above) i
 ## 📢 Updates
 
 - **2026-10-16** — RL now fixes the trainer–inference mismatch by default (fp32 LM head on both the trainer and vLLM, and vLLM's own log-probs as π_old in the PPO ratio); configs it can't support (e.g. top-p < 1, async or SGLang rollout, LoRA) stop at startup with an error naming the flag to set to `false`.
+- **2026-09-22** — Fixed how SFT applies the positional-encoding (YaRN) context extension. The `block_size`/`rope_scaling` change was applied after the model was built, so SFT runs with a longer context than the 1,024-token pretraining context trained with plain RoPE extrapolation while the saved config claimed YaRN. The config is now patched before the model is instantiated, so training and inference both use YaRN (factor 3, 1,024 → 3,072 tokens). In our reruns this improves SFT, most clearly for the 20M and 50M models. Thanks to Jens Tuyls for spotting it.
 
 ---
 
